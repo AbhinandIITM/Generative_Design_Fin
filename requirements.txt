@@ -1,0 +1,4 @@
+cadquery
+gmsh
+matplotlib
+numpy

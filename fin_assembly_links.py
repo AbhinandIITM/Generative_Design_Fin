@@ -257,6 +257,10 @@ def main():
 
     model = build_assembly(args.chord, args.total_length,
                             args.rib_count, args.rib_thickness)
+    
+    # Rotate 90 degrees around the X-axis so the span is vertical (Z-axis)
+    # model = model.rotate((0, 0, 0), (1, 0, 0), 90)
+    
     model.export(args.step)
     print('Wrote STEP:', args.step)
 
