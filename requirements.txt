@@ -2,3 +2,4 @@ cadquery
 gmsh
 matplotlib
 numpy
+mpi4py
