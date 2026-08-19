@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-run_fenicsx_to.py -- Parallel FEniCSx-based Topology Optimization Codepath
+visualize_fenicsx_fea.py -- Parallel FEniCSx FEA with Detailed Results Export
 
-This script serves as a starting point for moving topology optimization
-and generative design research to FEniCSx (dolfinx). 
-It features MPI-based parallel meshing and solving, which is ideal
-for large-scale TO on workstations or clusters.
+This script runs the FEniCSx Finite Element Analysis (FEA) on the 
+fin assembly and exports detailed results (mesh, boundary markers, 
+displacements, and Von Mises stress fields) to XDMF format so they 
+can be visually inspected in ParaView (GUI) similarly to Ansys.
 
 Dependencies:
     conda install -c conda-forge fenics-dolfinx mpich
@@ -33,23 +33,29 @@ except ImportError as e:
 
 import gmsh
 
-def create_and_read_mesh(comm, mesh_size=2.0, l=105.0, w=15.0, h=70.0):
+def create_and_read_mesh(comm, mesh_size=2.0, step_file="fin_assembly_links.step"):
     """
-    Generate a simple 3D bounding box mesh for TO using Gmsh, 
+    Generate a 3D mesh from a STEP file using Gmsh, 
     and read it into a dolfinx mesh in parallel.
     """
     gmsh.initialize()
     if comm.rank == 0:
-        gmsh.model.add("fin_bounding_box")
-        # For TO, we typically start with a block and optimize material density
-        box = gmsh.model.occ.addBox(0, 0, 0, l, w, h)
+        gmsh.model.add("fin_assembly")
+        gmsh.model.occ.importShapes(step_file)
+        gmsh.model.occ.healShapes()
         gmsh.model.occ.synchronize()
         
         # Physical groups
-        gmsh.model.addPhysicalGroup(3, [box], tag=1)
+        volumes = gmsh.model.getEntities(dim=3)
+        vol_tags = [t for _, t in volumes]
+        if vol_tags:
+            gmsh.model.addPhysicalGroup(3, vol_tags, tag=1)
         
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size * 0.15)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size)
+        gmsh.option.setNumber("Mesh.Algorithm3D", 1)       # Delaunay
+        gmsh.option.setNumber("Mesh.Optimize", 1)
+        gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
         gmsh.model.mesh.generate(3)
         
     # Import gmsh model into dolfinx mesh
@@ -111,18 +117,61 @@ def run_fenicsx_fea(mesh_size=2.0):
     # Weak form
     a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
     
-    # Body force (e.g. pressure or gravity)
-    f = fem.Constant(domain, dolfinx.default_scalar_type((0.0, -9.81e-3, 0.0)))
-    L = ufl.inner(f, v) * ufl.dx
+    # Boundary conditions and Loads
+    x_coords = domain.geometry.x
+    y_min = comm.allreduce(np.min(x_coords[:, 1]), op=MPI.MIN)
+    y_max = comm.allreduce(np.max(x_coords[:, 1]), op=MPI.MAX)
+    tol = 1e-1
     
-    # Boundary conditions (Fix at x = 0 plane)
-    def left_boundary(x):
-        return np.isclose(x[0], 0.0)
-        
     fdim = domain.topology.dim - 1
-    boundary_facets = mesh.locate_entities_boundary(domain, fdim, left_boundary)
+    
+    # Identify facets
+    root_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[1], y_min, atol=tol))
+    tip_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[1], y_max, atol=tol))
+    
+    domain.topology.create_connectivity(fdim, domain.topology.dim)
+    exterior_facets = mesh.exterior_facet_indices(domain.topology)
+    
+    # Create facet markers (1: root, 2: tip, 3: other exterior)
+    facet_indices = np.copy(exterior_facets)
+    facet_markers = np.full_like(facet_indices, 3, dtype=np.int32)
+    
+    sort_idx = np.argsort(facet_indices)
+    facet_indices = facet_indices[sort_idx]
+    facet_markers = facet_markers[sort_idx]
+    
+    # Safely mark root and tip
+    root_idx = np.searchsorted(facet_indices, root_facets)
+    valid_root = (root_idx < len(facet_indices)) & (facet_indices[root_idx % len(facet_indices)] == root_facets)
+    facet_markers[root_idx[valid_root]] = 1
+    
+    tip_idx = np.searchsorted(facet_indices, tip_facets)
+    valid_tip = (tip_idx < len(facet_indices)) & (facet_indices[tip_idx % len(facet_indices)] == tip_facets)
+    facet_markers[tip_idx[valid_tip]] = 2
+    
+    mt = mesh.meshtags(domain, fdim, facet_indices, facet_markers)
+    ds = ufl.Measure("ds", domain=domain, subdomain_data=mt)
+    
+    # Dirichlet BC (Fixed at root)
     u_D = np.array([0.0, 0.0, 0.0], dtype=dolfinx.default_scalar_type)
-    bc = fem.dirichletbc(u_D, fem.locate_dofs_topological(V, fdim, boundary_facets), V)
+    bc = fem.dirichletbc(u_D, fem.locate_dofs_topological(V, fdim, root_facets), V)
+    
+    # Loads
+    # 1. Hydrostatic Pressure (0.0981 MPa on all exterior faces, including root)
+    pressure = fem.Constant(domain, dolfinx.default_scalar_type(0.0981))
+    n = ufl.FacetNormal(domain)
+    L_pressure = -pressure * ufl.inner(n, v) * (ds(1) + ds(2) + ds(3))
+    
+    # 2. Tip compressive load (450N in -Y direction)
+    # Calculate tip area
+    tip_area_form = fem.form(fem.Constant(domain, dolfinx.default_scalar_type(1.0)) * ds(2))
+    tip_area = comm.allreduce(fem.assemble_scalar(tip_area_form), op=MPI.SUM)
+    T_tip = 450.0 / tip_area if tip_area > 0 else 0.0
+    t_tip = fem.Constant(domain, dolfinx.default_scalar_type((0.0, -T_tip, 0.0)))
+    L_tip = ufl.inner(t_tip, v) * ds(2)
+    
+    # Total linear form
+    L = L_pressure + L_tip
     
     # ---------------------------------------------------------
     # 3. Solve
@@ -130,6 +179,7 @@ def run_fenicsx_fea(mesh_size=2.0):
     t0_solve = time.time()
     problem = LinearProblem(a, L, bcs=[bc], petsc_options={"ksp_type": "cg", "pc_type": "gamg"}, petsc_options_prefix="sys_")
     uh = problem.solve()
+    uh.name = "Displacement"
     t1_solve = time.time()
     solve_time = t1_solve - t0_solve
     
@@ -139,8 +189,8 @@ def run_fenicsx_fea(mesh_size=2.0):
     # ---------------------------------------------------------
     # 4. Results
     # ---------------------------------------------------------
-    # Calculate compliance: inner(f, u)
-    compliance_form = fem.form(ufl.inner(f, uh) * ufl.dx)
+    # Calculate compliance
+    compliance_form = fem.form(ufl.replace(L, {v: uh}))
     compliance = comm.allreduce(fem.assemble_scalar(compliance_form), op=MPI.SUM)
     
     # Volume
@@ -164,11 +214,12 @@ def run_fenicsx_fea(mesh_size=2.0):
     expr = fem.Expression(von_Mises, V_vm.element.interpolation_points)
     vm_func = fem.Function(V_vm)
     vm_func.interpolate(expr)
+    vm_func.name = "Von_Mises_Stress"
     max_vm = comm.allreduce(np.max(vm_func.x.array) if len(vm_func.x.array) > 0 else 0.0, op=MPI.MAX)
     
     if rank == 0:
         print("\n" + "="*50)
-        print(" FEniCSx TO Base Summary ")
+        print(" FEniCSx FEA Summary ")
         print("="*50)
         print(f" MPI Processes        : {comm.size}")
         print(f" Mesh Time            : {mesh_time:.4f} s")
@@ -180,8 +231,27 @@ def run_fenicsx_fea(mesh_size=2.0):
         print(f" Max Von Mises Stress : {max_vm:.3f} MPa")
         print("="*50 + "\n")
 
+    # ---------------------------------------------------------
+    # 5. Export for ParaView Visualization
+    # ---------------------------------------------------------
+    if rank == 0:
+        print("[0] Exporting mesh, boundaries, and results to XDMF...")
+        
+    # We output two files to prevent meshtags from cluttering function space visualizers
+    with dolfinx.io.XDMFFile(comm, "fenicsx_boundaries.xdmf", "w") as xdmf:
+        xdmf.write_mesh(domain)
+        xdmf.write_meshtags(mt, domain.geometry)
+        
+    with dolfinx.io.XDMFFile(comm, "fenicsx_results.xdmf", "w") as xdmf:
+        xdmf.write_mesh(domain)
+        xdmf.write_function(uh)
+        xdmf.write_function(vm_func)
+        
+    if rank == 0:
+        print("[0] Export complete. You can open fenicsx_results.xdmf and fenicsx_boundaries.xdmf in ParaView.")
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parallel FEniCSx Topology Optimization Starter")
+    parser = argparse.ArgumentParser(description="Parallel FEniCSx FEA with Visualization Export")
     parser.add_argument("--mesh-size", type=float, default=2.0, help="Target mesh size")
     args = parser.parse_args()
     
