@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import numpy as np
@@ -658,15 +659,19 @@ def run_fea(step_path: str, *,
     print(f"{'=' * 70}\n")
 
     # 1. Mesh
+    t0_mesh = time.time()
     mesh_info = mesh_step_file(step_path, mesh_size, element_order,
                                job, work_dir)
+    t1_mesh = time.time()
 
     # 2. Write CalculiX input deck
     write_calculix_deck(mesh_info, job, work_dir,
                         material, pressure_mpa, frequency)
 
     # 3. Solve
+    t0_solve = time.time()
     rc = run_calculix(job, work_dir)
+    t1_solve = time.time()
 
     # 4. Parse results
     if rc == 0:
@@ -679,6 +684,8 @@ def run_fea(step_path: str, *,
         results[key] = mesh_info[key]
     results["root_node_count"] = len(mesh_info["root_nodes"])
     results["tip_node_count"]  = len(mesh_info["tip_nodes"])
+    results["mesh_time_s"]     = t1_mesh - t0_mesh
+    results["solve_time_s"]    = t1_solve - t0_solve
 
     # Mass estimate from CAD volume and material density
     mat = MATERIALS.get(material)
