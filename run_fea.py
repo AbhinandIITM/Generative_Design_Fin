@@ -275,7 +275,7 @@ def mesh_step_file(step_path: str, mesh_size: float, element_order: int,
 
 def write_calculix_deck(mesh_info: dict, job: str, work_dir: str,
                         material: str, pressure_mpa: float,
-                        run_frequency: bool) -> str:
+                        solver: str, run_frequency: bool) -> str:
     """Write the master CalculiX .inp that *INCLUDEs the Gmsh mesh and adds
     node sets, material, BCs, loads, and solver steps.
 
@@ -339,7 +339,12 @@ def write_calculix_deck(mesh_info: dict, job: str, work_dir: str,
         f.write("** STEP 1 -- Static bending under pressure load\n")
         f.write("** " + "=" * 60 + "\n")
         f.write("*STEP\n")
-        f.write("*STATIC\n")
+        if solver.lower() == "pardiso":
+            f.write("*STATIC, SOLVER=PARDISO\n")
+        elif solver.lower() == "iterative":
+            f.write("*STATIC, SOLVER=ITERATIVECHOLESKY\n")
+        else:
+            f.write("*STATIC\n")
         f.write("**\n")
 
         # Fixed root  (constrain DOFs 1-3: all translations)
@@ -419,10 +424,14 @@ def run_calculix(job: str, work_dir: str) -> int:
 
     cmd = [ccx, "-i", job]
     
-    # Enable multithreading for SPOOLES
+    # Enable multithreading across all stages
     env = os.environ.copy()
-    num_threads = str((os.cpu_count()-6) or 4)
+    num_threads = str(max(1, (os.cpu_count() or 4) - 2))
     env["OMP_NUM_THREADS"] = num_threads
+    env["CCX_NPROC_STIFFNESS"] = num_threads
+    env["CCX_NPROC_EQUATION_SOLVER"] = num_threads
+    env["CCX_NPROC_RESULTS"] = num_threads
+    env["NUMBER_OF_CPUS"] = num_threads
 
     print(f"[ccx]  Running:  {' '.join(cmd)}  (cwd: {work_dir}) with {num_threads} threads")
     result = subprocess.run(cmd, cwd=work_dir, env=env,
@@ -613,16 +622,16 @@ def parse_results(job: str, work_dir: str) -> dict:
 
     return results
 
-
 # ===============================================================================
 #  PUBLIC API  (call from Python / RL loops)
 # ===============================================================================
 
-def run_fea(step_path: str, *,
+def run_fea(step_path: str,
             mesh_size: float = 2.0,
             element_order: int = 2,
             material: str = "pla",
             pressure_mpa: float = 0.0981,
+            solver: str = "spooles",
             frequency: bool = False,
             work_dir: str = "fea_results") -> dict:
     """End-to-end FEA pipeline:  STEP → mesh → solve → results dict.
@@ -666,7 +675,7 @@ def run_fea(step_path: str, *,
 
     # 2. Write CalculiX input deck
     write_calculix_deck(mesh_info, job, work_dir,
-                        material, pressure_mpa, frequency)
+                        material, pressure_mpa, solver, frequency)
 
     # 3. Solve
     t0_solve = time.time()
@@ -718,7 +727,7 @@ def run_fea(step_path: str, *,
 
 def main():
     p = argparse.ArgumentParser(
-        description="Automated FEA:  STEP → Gmsh → CalculiX → results",
+        description="Automated FEA:  STEP -> Gmsh -> CalculiX -> results",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\\
             Examples
@@ -740,6 +749,9 @@ def main():
                    help="Material name  (default: pla)")
     p.add_argument("--pressure-mpa", type=float, default=0.0981,
                    help="Hydrostatic pressure on external surfaces in MPa (default: 0.0981 for 10m depth)")
+    p.add_argument("--solver", default="spooles",
+                   choices=["spooles", "pardiso", "iterative"],
+                   help="Linear equation solver to use (default: spooles)")
     p.add_argument("--frequency", action="store_true",
                    help="Add a modal-analysis step (first 10 natural modes)")
     p.add_argument("--work-dir", default="fea_results",
@@ -753,6 +765,7 @@ def main():
         element_order=args.element_order,
         material=args.material,
         pressure_mpa=args.pressure_mpa,
+        solver=args.solver,
         frequency=args.frequency,
         work_dir=args.work_dir,
     )
