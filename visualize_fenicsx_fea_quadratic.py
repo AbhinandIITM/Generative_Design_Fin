@@ -116,8 +116,8 @@ def run_fenicsx_fea(mesh_size=2.0):
     # ---------------------------------------------------------
     # 2. Function Spaces and Variational Problem (Linear Elasticity)
     # ---------------------------------------------------------
-    # Using a continuous Galerkin function space of degree 1
-    V = fem.functionspace(domain, ("Lagrange", 1, (domain.geometry.dim,)))
+    # Using a continuous Galerkin function space of degree 2 (Quadratic Elements)
+    V = fem.functionspace(domain, ("Lagrange", 2, (domain.geometry.dim,)))
     
     # Material properties (PLA-like)
     E = 3500.0  # MPa
@@ -271,7 +271,7 @@ def run_fenicsx_fea(mesh_size=2.0):
         print("[0] Export complete. You can open fenicsx_results.xdmf and fenicsx_boundaries.xdmf in ParaView.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parallel FEniCSx FEA with Visualization Export")
+    parser = argparse.ArgumentParser(description="Parallel FEniCSx FEA (Quadratic) with Visualization Export")
     parser.add_argument("--mesh-size", type=float, default=2.0, help="Target mesh size")
     args = parser.parse_args()
     
